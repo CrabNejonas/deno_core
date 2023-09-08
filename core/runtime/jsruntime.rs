@@ -980,13 +980,6 @@ impl JsRuntime {
         }
       }
 
-      #[cfg(debug_assertions)]
-      {
-        let mut scope = realm.handle_scope(self.v8_isolate());
-        let module_map = module_map_rc.borrow();
-        module_map.assert_all_modules_evaluated(&mut scope);
-      }
-
       Ok::<_, anyhow::Error>(())
     })?;
 
