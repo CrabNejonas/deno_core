@@ -75,7 +75,7 @@ impl<F: Future> Future for Cancelable<F> {
     // Fuse: if this Future is completed or canceled, make sure the inner
     // `future` and `registration` fields are dropped in order to unlink it from
     // its cancel handle.
-    if matches!(poll_result, Poll::Ready(_)) {
+    if poll_result.is_ready() {
       self.set(Cancelable::Terminated)
     }
     poll_result
@@ -132,15 +132,74 @@ where
   }
 }
 
+#[pin_project(project = AbortableProjection)]
+#[derive(Debug)]
+pub struct Abortable<F>
+where
+  F: Unpin,
+{
+  #[pin]
+  inner: Cancelable<F>,
+}
+
+impl<F, T> Future for Abortable<F>
+where
+  F: Future<Output = T> + Unpin,
+{
+  type Output = Result<F::Output, F>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    let mut cancelable = self.project().inner;
+    match cancelable.as_mut().project() {
+      CancelableProjection::Pending {
+        future,
+        registration,
+      } => match Cancelable::<F>::poll_pending(future, registration, cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(res)) => Poll::Ready(Ok(res)),
+        Poll::Ready(Err(Canceled)) => {
+          let f = cancelable.take_inner();
+          Poll::Ready(Err(f.unwrap()))
+        }
+      },
+      CancelableProjection::Terminated => {
+        panic!("poll() called after completion")
+      }
+    }
+  }
+}
+
+impl<F, T, E> FusedFuture for Abortable<F>
+where
+  F: Future<Output = Result<T, E>> + Unpin,
+  Canceled: Into<E>,
+{
+  fn is_terminated(&self) -> bool {
+    self.inner.is_terminated()
+  }
+}
+
 pub trait CancelFuture
 where
   Self: Future + Sized,
 {
+  // Returns a [`Canceled`] error if the handle is canceled.
   fn or_cancel<H: RcLike<CancelHandle>>(
     self,
     cancel_handle: H,
   ) -> Cancelable<Self> {
     Cancelable::new(self, cancel_handle.into())
+  }
+
+  /// For unpinnable futures, returns the future on cancellation rather than an error.
+  fn or_abort<H: RcLike<CancelHandle>>(
+    self,
+    cancel_handle: H,
+  ) -> Abortable<Self>
+  where
+    Self: Unpin,
+  {
+    Abortable::new(self, cancel_handle.into())
   }
 }
 
@@ -184,6 +243,7 @@ impl From<Canceled> for io::Error {
 }
 
 mod internal {
+  use super::Abortable;
   use super::CancelHandle;
   use super::Cancelable;
   use super::Canceled;
@@ -210,6 +270,33 @@ mod internal {
       Self::Pending {
         future,
         registration,
+      }
+    }
+
+    /// Take the inner future if it is [`Unpin`]able and we are still pending.
+    pub(super) fn take_inner(self: Pin<&mut Self>) -> Option<F>
+    where
+      F: Unpin,
+    {
+      // SAFETY: We know that the registration is not unpinnable, but the future is.
+      unsafe {
+        let unsafe_mut = self.get_unchecked_mut();
+        match unsafe_mut {
+          Self::Pending {
+            future,
+            registration,
+          } => {
+            // Drop the registration without unpinning. This is safe as we don't move it.
+            std::ptr::drop_in_place(registration);
+            // Move the future data (it's Unpin and we're going to overwrite the other bits below, so this is safe)
+            let f = std::ptr::read(future);
+            // Overwrite the whole struct with Cancelable::Terminated to avoid double-drops for both future and registration
+            std::ptr::write(unsafe_mut, Cancelable::Terminated);
+            // We've liberated the future!
+            Some(f)
+          }
+          Self::Terminated => None,
+        }
       }
     }
 
@@ -254,6 +341,14 @@ mod internal {
       node.register(cx.waker(), head_node)?;
 
       Poll::Pending
+    }
+  }
+
+  impl<F: Future + Unpin> Abortable<F> {
+    pub(super) fn new(future: F, cancel_handle: RcRef<CancelHandle>) -> Self {
+      Self {
+        inner: Cancelable::new(future, cancel_handle),
+      }
     }
   }
 
@@ -304,13 +399,9 @@ mod internal {
         Some((head, rc)) => {
           // Register this `Cancelable` node with a `CancelHandle` head node.
           assert_ne!(self, head);
-          // TODO(piscisaureus): safety comment
-          #[allow(clippy::undocumented_unsafe_blocks)]
-          let self_inner = unsafe { &mut *self.inner.get() };
-          // TODO(piscisaureus): safety comment
-          #[allow(clippy::undocumented_unsafe_blocks)]
-          let head_inner = unsafe { &mut *head.inner.get() };
-          self_inner.link(waker, head_inner, rc)
+          let self_inner = NonNull::new(self.inner.get()).unwrap();
+          let head_inner = NonNull::new(head.inner.get()).unwrap();
+          NodeInner::link(self_inner, waker, head_inner, rc)
         }
         None => {
           // This `Cancelable` has already been linked to a `CancelHandle` head
@@ -374,30 +465,31 @@ mod internal {
   }
 
   impl NodeInner {
-    fn as_non_null(&mut self) -> NonNull<Self> {
-      NonNull::from(self)
-    }
-
     fn link(
-      &mut self,
+      mut this: NonNull<NodeInner>,
       waker: &Waker,
-      head: &mut Self,
+      mut head: NonNull<NodeInner>,
       rc_pin: &Rc<dyn Any>,
     ) -> Result<(), Canceled> {
-      // The future should not have been linked to a cancel handle before.
-      assert!(matches!(self, NodeInner::Unlinked));
+      // SAFETY: head and this are different pointers
+      let head_mut = unsafe { head.as_mut() };
+      // SAFETY: head and this are different pointers
+      let this_mut = unsafe { this.as_mut() };
 
-      match head {
+      // The future should not have been linked to a cancel handle before.
+      assert!(matches!(this_mut, NodeInner::Unlinked));
+
+      match head_mut {
         NodeInner::Unlinked => {
-          *head = NodeInner::Linked {
+          *head_mut = NodeInner::Linked {
             kind: NodeKind::head(rc_pin),
-            prev: self.as_non_null(),
-            next: self.as_non_null(),
+            prev: this,
+            next: this,
           };
-          *self = NodeInner::Linked {
+          *this_mut = NodeInner::Linked {
             kind: NodeKind::item(waker),
-            prev: head.as_non_null(),
-            next: head.as_non_null(),
+            prev: head,
+            next: head,
           };
           Ok(())
         }
@@ -406,19 +498,18 @@ mod internal {
           prev: next_prev_nn,
           ..
         } => {
-          // TODO(piscisaureus): safety comment
-          #[allow(clippy::undocumented_unsafe_blocks)]
-          let prev = unsafe { &mut *next_prev_nn.as_ptr() };
+          // SAFETY: prev is neither head nor this
+          let prev = unsafe { next_prev_nn.as_mut() };
           match prev {
             NodeInner::Linked {
               kind: NodeKind::Item { .. },
               next: prev_next_nn,
               ..
             } => {
-              *self = NodeInner::Linked {
+              *this_mut = NodeInner::Linked {
                 kind: NodeKind::item(waker),
-                prev: replace(next_prev_nn, self.as_non_null()),
-                next: replace(prev_next_nn, self.as_non_null()),
+                prev: replace(next_prev_nn, this),
+                next: replace(prev_next_nn, this),
               };
               Ok(())
             }
@@ -600,7 +691,7 @@ mod tests {
 
   async fn ready_in_n(name: &str, count: usize) -> &str {
     let mut remaining = count as isize;
-    poll_fn(|_| {
+    poll_fn(move |_| {
       assert!(remaining >= 0);
       if remaining == 0 {
         Poll::Ready(name)
@@ -684,6 +775,7 @@ mod tests {
     assert!(!cancel_handles.iter().any(|c| !c.is_canceled()));
   }
 
+  #[cfg(not(miri))]
   #[tokio::test]
   async fn cancel_try_future() {
     {
@@ -714,52 +806,166 @@ mod tests {
     }
   }
 
-  #[tokio::test]
-  async fn future_cancels_itself_before_completion() {
-    // A future cancels itself before it reaches completion. This future should
-    // indeed get canceled and should not be polled again.
-    let cancel_handle = CancelHandle::new_rc();
-    let result = async {
-      cancel_handle.cancel();
-      yield_now().await;
-      unreachable!();
-    }
-    .or_cancel(&cancel_handle)
-    .await;
-    assert_eq!(result.unwrap_err(), Canceled);
+  /// Test polling without tokio so we can use miri.
+  #[test]
+  fn abort_poll_once() {
+    let cancel_handle = Rc::new(CancelHandle::new());
+    let f = pending::<u32>();
+    let mut f = Box::pin(f.or_abort(&cancel_handle));
+    let res = f.as_mut().poll(&mut Context::from_waker(noop_waker_ref()));
+    assert!(res.is_pending());
+    cancel_handle.cancel();
+    let res = f.as_mut().poll(&mut Context::from_waker(noop_waker_ref()));
+    let Poll::Ready(Err(mut f)) = res else {
+      panic!("wasn't cancelled!");
+    };
+    assert!(f
+      .poll_unpin(&mut Context::from_waker(noop_waker_ref()))
+      .is_pending());
   }
 
-  #[tokio::test]
-  async fn future_cancels_itself_and_hangs() {
-    // A future cancels itself, after which it returns `Poll::Pending` without
-    // setting up a waker that would allow it to make progress towards
-    // completion. Nevertheless, the `Cancelable` wrapper future must finish.
-    let cancel_handle = CancelHandle::new_rc();
-    let result = async {
-      yield_now().await;
-      cancel_handle.cancel();
-      pending!();
-      unreachable!();
+  /// Test polling without tokio so we can use miri.
+  #[test]
+  fn abort_poll() {
+    struct CountdownFuture(u32, String);
+    impl Future for CountdownFuture {
+      type Output = String;
+      fn poll(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+      ) -> Poll<Self::Output> {
+        self.as_mut().0 = self.as_mut().0 - 1;
+        if self.as_mut().0 == 0 {
+          Poll::Ready(self.1.clone())
+        } else {
+          Poll::Pending
+        }
+      }
     }
-    .or_cancel(&cancel_handle)
-    .await;
-    assert_eq!(result.unwrap_err(), Canceled);
+
+    let cancel_handle = Rc::new(CancelHandle::new());
+    let f = CountdownFuture(2, "hello world!".into());
+    let mut f = Box::pin(f.or_abort(cancel_handle.clone()));
+    let res = f.as_mut().poll(&mut Context::from_waker(noop_waker_ref()));
+    assert!(res.is_pending());
+    cancel_handle.clone().cancel();
+    let res = f.as_mut().poll(&mut Context::from_waker(noop_waker_ref()));
+    let Poll::Ready(Err(mut f)) = res else {
+      panic!("wasn't cancelled!");
+    };
+    let res = f.poll_unpin(&mut Context::from_waker(noop_waker_ref()));
+    assert_eq!(res, Poll::Ready("hello world!".into()));
   }
 
-  #[tokio::test]
-  async fn future_cancels_itself_and_completes() {
-    // A TryFuture attempts to cancel itself while it is getting polled, and
-    // yields a result from the very same `poll()` call. Because this future
-    // actually reaches completion, the attempted cancellation has no effect.
-    let cancel_handle = CancelHandle::new_rc();
-    let result = async {
-      yield_now().await;
+  #[test]
+  fn abort_future() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    runtime.block_on(async {
+      // Abort a spawned task before it actually runs.
+      let cancel_handle = Rc::new(CancelHandle::new());
+      let future = spawn(async { 1_u8 }).or_abort(&cancel_handle);
       cancel_handle.cancel();
-      Ok::<_, io::Error>("done")
-    }
-    .try_or_cancel(&cancel_handle)
-    .await;
-    assert_eq!(result.unwrap(), "done");
+      let error = future.await.unwrap_err();
+      assert_eq!(error.await.expect("failed"), 1_u8);
+    });
+  }
+
+  #[test]
+  fn abort_multiple_times() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    runtime.block_on(async {
+      // Abort a future multiple times
+      let cancel_handle = Rc::new(CancelHandle::new());
+      let mut future = spawn(async {
+        tokio::task::yield_now().await;
+        1_u8
+      })
+      .or_abort(&cancel_handle);
+      cancel_handle.cancel();
+
+      for _ in 0..10 {
+        match future.await {
+          Ok(_) => {
+            panic!("should not have resolved");
+          }
+          Err(f) => {
+            future = f.or_abort(&cancel_handle);
+          }
+        }
+      }
+
+      let f = future.await.expect_err("should still be failing");
+
+      // But we can still await the underlying future
+      assert_eq!(f.await.unwrap(), 1);
+    });
+  }
+
+  #[test]
+  fn future_cancels_itself_before_completion() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    runtime.block_on(async {
+      // A future cancels itself before it reaches completion. This future should
+      // indeed get canceled and should not be polled again.
+      let cancel_handle = CancelHandle::new_rc();
+      let result = async {
+        cancel_handle.cancel();
+        yield_now().await;
+        unreachable!();
+      }
+      .or_cancel(&cancel_handle)
+      .await;
+      assert_eq!(result.unwrap_err(), Canceled);
+    })
+  }
+
+  #[test]
+  fn future_cancels_itself_and_hangs() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    runtime.block_on(async {
+      // A future cancels itself, after which it returns `Poll::Pending` without
+      // setting up a waker that would allow it to make progress towards
+      // completion. Nevertheless, the `Cancelable` wrapper future must finish.
+      let cancel_handle = CancelHandle::new_rc();
+      let result = async {
+        yield_now().await;
+        cancel_handle.cancel();
+        pending!();
+        unreachable!();
+      }
+      .or_cancel(&cancel_handle)
+      .await;
+      assert_eq!(result.unwrap_err(), Canceled);
+    });
+  }
+
+  #[test]
+  fn future_cancels_itself_and_completes() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    runtime.block_on(async {
+      // A TryFuture attempts to cancel itself while it is getting polled, and
+      // yields a result from the very same `poll()` call. Because this future
+      // actually reaches completion, the attempted cancellation has no effect.
+      let cancel_handle = CancelHandle::new_rc();
+      let result = async {
+        yield_now().await;
+        cancel_handle.cancel();
+        Ok::<_, io::Error>("done")
+      }
+      .try_or_cancel(&cancel_handle)
+      .await;
+      assert_eq!(result.unwrap(), "done");
+    });
   }
 
   #[test]
